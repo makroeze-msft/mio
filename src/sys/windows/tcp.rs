@@ -6,11 +6,16 @@ use std::os::windows::prelude::*;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use winapi::um::minwinbase::OVERLAPPED_ENTRY;
+use winapi::um::winnt::HANDLE;
+
+
+
 use miow::iocp::CompletionStatus;
 use miow::net::*;
-use net2::{TcpBuilder, TcpStreamExt as Net2TcpExt};
-use winapi::*;
-use iovec::IoVec;
+use net2::{TcpStreamExt as Net2TcpExt};
+use iovec::{IoVec, IoVecMut};
+use socket2::{Socket, Domain, Type};
 
 use {poll, Ready, Poll, PollOpt, Token};
 use event::Evented;
@@ -277,10 +282,8 @@ impl TcpStream {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match IoVec::from_bytes_mut(buf) {
-            Some(vec) => self.readv(&mut [vec]),
-            None => Ok(0),
-        }
+        self.readv(&mut [&mut IoVecMut::from_bytes(buf)])
+        
     }
 
     pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -296,7 +299,7 @@ impl TcpStream {
         }
     }
 
-    pub fn readv(&self, bufs: &mut [&mut IoVec]) -> io::Result<usize> {
+    pub fn readv(&self, bufs: &mut [&mut IoVecMut]) -> io::Result<usize> {
         let mut me = self.before_read()?;
 
         // TODO: Does WSARecv work on a nonblocking sockets? We ideally want to
@@ -348,10 +351,7 @@ impl TcpStream {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        match IoVec::from_bytes(buf) {
-            Some(vec) => self.writev(&[vec]),
-            None => Ok(0),
-        }
+        self.writev(&mut [&mut IoVec::from_bytes(buf)])
     }
 
     pub fn writev(&self, bufs: &[&IoVec]) -> io::Result<usize> {
@@ -742,24 +742,19 @@ impl ListenerImp {
         me.iocp.set_readiness(me.iocp.readiness() - Ready::readable());
 
         let res = match self.inner.family {
-            Family::V4 => TcpBuilder::new_v4(),
-            Family::V6 => TcpBuilder::new_v6(),
-        }.and_then(|builder| unsafe {
-            trace!("scheduling an accept");
-            self.inner.socket.accept_overlapped(&builder, &mut me.accept_buf,
-                                                self.inner.accept.as_mut_ptr())
-        });
-        match res {
-            Ok((socket, _)) => {
-                // see docs above on StreamImp.inner for rationale on forget
-                me.accept = State::Pending(socket);
-                mem::forget(self.clone());
-            }
-            Err(e) => {
-                me.accept = State::Error(e);
-                self.add_readiness(me, Ready::readable());
-            }
-        }
+            Family::V4 => Domain::ipv4(),
+            Family::V6 => Domain::ipv6(),
+        };
+
+        let socket = Socket::new(res, Type::stream(), None).unwrap().into_tcp_stream();
+        trace!("scheduling an accept");
+        unsafe {
+            self.inner.socket.accept_overlapped(&socket, &mut me.accept_buf,
+                                                self.inner.accept.as_mut_ptr());
+        };
+        
+        me.accept = State::Pending(socket);
+        mem::forget(self.clone());
     }
 
     // See comments in StreamImp::push
